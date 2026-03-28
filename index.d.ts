@@ -1,0 +1,10 @@
+export type PersistenceReactiveFnCallbacks = Function;
+export declare function PersistenceReactiveSetFn(fn: PersistenceReactiveFnCallbacks): void;
+export type PersistenceReactiveSource = Record<string, any>;
+export declare function PersistenceReactiveSetSource(source: PersistenceReactiveSource): void;
+export declare function PersistenceReactive(className: string, handlers?: Record<string, any>, hooks?: Record<string, any>): Promise<void>;
+export type PersistenceInternalHandlerFnCallback = Function;
+export declare function PersistenceInternalHandlerSet(handler: string, fn: PersistenceInternalHandlerFnCallback): void;
+export type PersistenceFormFnCallback = Function;
+export declare function PersistenceFormSetFn(fn: PersistenceFormFnCallback): void;
+export declare function PersistenceForm(handlers?: Record<string, any>, hooks?: Record<string, any>, delay?: number): any;
