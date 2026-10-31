@@ -1,6 +1,6 @@
 {
   "name": "dx-save",
-  "version": "2.0.0",
+  "version": "3.0.0",
   "description": "An agnostic, asynchronous, and reactive data persistence engine for JavaScript/TypeScript. Designed to seamlessly handle auto-saving, optimistic UI, debouncing, and error recovery without triggering infinite reactive loops.",
   "type": "module",
   "main": "index.js",
@@ -14,10 +14,17 @@
   },
   "files": [
     "index.js",
-    "index.d.ts"
+    "index.d.ts",
+    "CHANGELOG.md"
   ],
+  "scripts": {
+    "test": "node --test"
+  },
   "keywords": [
     "DX",
+    "autosave",
+    "optimistic-ui",
+    "debounce",
     "Developer",
     "Experience",
     "Lightweight",
@@ -25,7 +32,7 @@
     "Dependency-free"
   ],
   "engines": {
-    "node": ">=16.0.0"
+    "node": ">=18.0.0"
   },
   "sideEffects": true,
   "license": "MIT",

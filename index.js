@@ -1,215 +1,431 @@
-const debounces = Object.create(null);
-function debounce(id, callback, delay = 2000) {
-    clearTimeout(debounces[id]);
-    debounces[id] = setTimeout(function () {
-        delete debounces[id];
-        callback();
-    }, delay);
+// DX Save: agnostic, asynchronous and reactive data persistence engine.
+
+const DEFAULT_DELAY = 2000;
+const SYSTEM_FLAG = '__isSystemRollback';
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+const noop = () => { };
+const isObjectLike = (value) => value !== null && typeof value === 'object';
+const hasOwn = (object, key) => Object.prototype.hasOwnProperty.call(object, key);
+const errorMessage = (e) => (e && e.message) || String(e);
+const normalizeDelay = (delay) => (Number.isFinite(delay) && delay >= 0 ? delay : DEFAULT_DELAY);
+
+function assertFunction(name, fn) {
+    if (typeof fn !== 'function') {
+        throw new TypeError('DX Save: ' + name + ' expects a function.');
+    }
 }
+
+function isMotor(candidate) {
+    return isObjectLike(candidate) && typeof candidate.set === 'function' && typeof candidate.save === 'function';
+}
+
+function isChanged({ value, previousValue }) {
+    // Objects may have been mutated in place, so they can't be compared by reference.
+    if (isObjectLike(value) && isObjectLike(previousValue)) {
+        return true;
+    }
+    return !Object.is(value, previousValue);
+}
+
+// ---------------------------------------------------------------------------
+// Logging (values are never logged, only property names and error messages)
+// ---------------------------------------------------------------------------
+
+let logger = { info: noop, warn: (...args) => console.warn(...args), error: (...args) => console.error(...args) };
+
+/**
+ * Replaces the logger. Levels that are missing are silent; `null` silences everything.
+ */
+export function PersistenceSetLogger(custom) {
+    logger = { info: noop, warn: noop, error: noop, ...(custom || {}) };
+}
+
+function log(level, ...args) {
+    try {
+        (logger[level] || noop)(...args);
+    }
+    catch (e) {
+        // A broken logger must never break persistence.
+    }
+}
+
+// ---------------------------------------------------------------------------
+// System writes: values written by the engine itself (rollbacks, write-backs)
+// must never be mistaken for user mutations by the reactive framework.
+// ---------------------------------------------------------------------------
+
+const systemWrites = new WeakMap();
+
+function systemWrite(object, property, value) {
+    let writes = systemWrites.get(object);
+    if (!writes) {
+        writes = new Map();
+        systemWrites.set(object, writes);
+    }
+    writes.set(property, value);
+    // Frameworks that notify asynchronously fire after the flag is gone; the
+    // remembered value lets isSystemWrite() recognise them for a short while.
+    const timer = setTimeout(function () {
+        if (writes.has(property) && Object.is(writes.get(property), value)) {
+            writes.delete(property);
+        }
+    }, 0);
+    if (timer && typeof timer.unref === 'function') {
+        timer.unref();
+    }
+    Object.defineProperty(object, SYSTEM_FLAG, {
+        value: true,
+        writable: true,
+        enumerable: false,
+        configurable: true
+    });
+    try {
+        object[property] = value;
+    }
+    finally {
+        delete object[SYSTEM_FLAG];
+    }
+}
+
+function isSystemWrite(object, property, value) {
+    if (!isObjectLike(object) && typeof object !== 'function') {
+        return false;
+    }
+    const flagged = Boolean(object[SYSTEM_FLAG]);
+    const writes = systemWrites.get(object);
+    if (writes && writes.has(property) && (flagged || Object.is(writes.get(property), value))) {
+        writes.delete(property);
+        return true;
+    }
+    return flagged;
+}
+
+// ---------------------------------------------------------------------------
+// Hooks: they observe persistence, they never influence it.
+// ---------------------------------------------------------------------------
+
+async function callHook(hooks, name, thisArg, ...args) {
+    if (!hooks || typeof hooks[name] !== 'function') {
+        return;
+    }
+    try {
+        await hooks[name].apply(thisArg, args);
+    }
+    catch (e) {
+        log('warn', 'DX Save: "' + name + '" hook failed:', errorMessage(e));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Intent queue: debounces mutations and serializes the saves of one target.
+// ---------------------------------------------------------------------------
+
+class IntentQueue {
+    constructor(delay, run) {
+        this.delay = normalizeDelay(delay);
+        this.run = run;
+        this.pending = Object.create(null);
+        this.timer = null;
+        this.tail = Promise.resolve();
+    }
+    add(property, value, readCurrentValue) {
+        // The first mutation of a batch captures the value to roll back to.
+        const intent = this.pending[property] || (this.pending[property] = { previousValue: readCurrentValue() });
+        intent.value = value;
+        clearTimeout(this.timer);
+        this.timer = setTimeout(() => this.flush(), this.delay);
+    }
+    flush() {
+        this.timer = null;
+        // Batches of the same target never overlap: each one waits for the previous save.
+        // The batch is taken only when its turn comes, so edits made while waiting are
+        // merged into it and stay visible to the rollback of the save in flight.
+        this.tail = this.tail
+            .then(() => {
+                const batch = this.pending;
+                if (!Object.keys(batch).length) {
+                    return;
+                }
+                this.pending = Object.create(null);
+                return this.run(batch, this);
+            })
+            .catch((e) => log('error', 'DX Save: unexpected persistence error:', errorMessage(e)));
+        return this.tail;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Persistence engine
+// ---------------------------------------------------------------------------
+
+let PersistenceInternalHandlers = {
+    'Upload': async function () { throw new Error('DX Save: initialize with PersistenceInternalHandlerSet("Upload", fn)'); }
+};
+
+export function PersistenceInternalHandlerSet(handler, fn) {
+    assertFunction('PersistenceInternalHandlerSet', fn);
+    PersistenceInternalHandlers[handler] = fn;
+}
+
+function fileExtension(file) {
+    const fromName = typeof file.name === 'string' && file.name.includes('.') ? file.name.split('.').pop() : '';
+    const fromType = typeof file.type === 'string' && file.type.includes('/') ? file.type.split('/').pop() : '';
+    return (fromName || fromType || '').toLowerCase() || undefined;
+}
+
+async function uploadFile(property, intent, motor) {
+    const value = intent.value;
+    let blob;
+    let format;
+    let webPath;
+    if (value && value.webPath && value.format) {
+        webPath = value.webPath;
+        format = value.format;
+        const response = await fetch(webPath);
+        if (!response.ok) {
+            throw new Error('Could not fetch "' + webPath + '" (HTTP ' + response.status + ').');
+        }
+        blob = await response.blob();
+    }
+    else if (value && value.files && value.files.length && value.files[0].name && value.files[0].size) {
+        blob = value.files[0];
+        format = value.format || fileExtension(blob);
+    }
+    else {
+        throw new Error('File is incompatible for uploading.');
+    }
+    if (motor && typeof motor.upload === 'function') {
+        intent.value = await motor.upload(blob, format, property);
+    }
+    else {
+        intent.value = await PersistenceInternalHandlers.Upload(format ? property + '.' + format : property, blob);
+    }
+    if (webPath) {
+        intent.maskValue = { url: webPath };
+    }
+}
+
+async function applyHandler(property, intent, handlers, motor) {
+    if (hasOwn(handlers, property) && typeof handlers[property] === 'function') {
+        log('info', 'DX Save: running handler for', property);
+        intent.value = await handlers[property](intent.value, intent.previousValue, intent);
+        return;
+    }
+    const images = handlers.images;
+    if (isObjectLike(images) && Array.isArray(images.properties) && images.properties.includes(property)) {
+        log('info', 'DX Save: uploading file for', property);
+        await uploadFile(property, intent, motor);
+    }
+}
+
+async function revertMotor(motor) {
+    if (!motor || typeof motor.revert !== 'function') {
+        return;
+    }
+    try {
+        await motor.revert();
+    }
+    catch (e) {
+        log('warn', 'DX Save: persistence source revert failed:', errorMessage(e));
+    }
+}
+
+function writeBack(object, properties, saveIntents, queue) {
+    for (const property of properties) {
+        // A newer edit is already queued: writing the older value would clobber it.
+        if (queue.pending[property]) {
+            continue;
+        }
+        const intent = saveIntents[property];
+        const next = intent.maskValue !== undefined ? intent.maskValue : intent.value;
+        try {
+            if (!Object.is(object[property], next)) {
+                systemWrite(object, property, next);
+            }
+        }
+        catch (e) {
+            log('error', 'DX Save: could not write back "' + property + '":', errorMessage(e));
+        }
+    }
+}
+
+function rollback(object, properties, saveIntents, queue) {
+    for (const property of properties) {
+        const intent = saveIntents[property];
+        const newer = queue.pending[property];
+        if (newer) {
+            // The user already edited this property again: keep their value, but
+            // make sure a failure of that newer edit rolls back to the persisted one.
+            newer.previousValue = intent.previousValue;
+            continue;
+        }
+        try {
+            systemWrite(object, property, intent.previousValue);
+        }
+        catch (e) {
+            log('error', 'DX Save: could not roll back "' + property + '":', errorMessage(e));
+        }
+    }
+}
+
+async function PersistenceInternalHandler(saveIntents, motor, object, handlers, hooks, queue) {
+    const properties = Object.keys(saveIntents);
+    log('info', 'DX Save: save intent for', properties);
+    const hasMotor = motor !== undefined && motor !== null;
+    const motorIsValid = hasMotor && isMotor(motor);
+    if (!hasMotor) {
+        log('warn', 'DX Save: no persistence source available, changes are not persisted.');
+    }
+    else if (!motorIsValid) {
+        log('error', 'DX Save: the persistence source must implement set() and save().');
+    }
+    let toSave = [];
+    let notToSave = [];
+    for (const property of properties) {
+        const intent = saveIntents[property];
+        if (!isChanged(intent)) {
+            continue;
+        }
+        if (hasMotor && !motorIsValid) {
+            notToSave.push(property);
+            continue;
+        }
+        let stage = 'handler';
+        try {
+            await applyHandler(property, intent, handlers, motor);
+            stage = 'set';
+            if (motorIsValid) {
+                await motor.set(property, intent.value);
+            }
+            toSave.push(property);
+        }
+        catch (e) {
+            log('error', 'DX Save: "' + property + '" ' + stage + ' error:', errorMessage(e));
+            notToSave.push(property);
+        }
+    }
+    if (toSave.length) {
+        callHook(hooks, 'preUpdate', object, toSave, notToSave);
+        try {
+            if (motorIsValid) {
+                await motor.save();
+            }
+        }
+        catch (e) {
+            log('error', 'DX Save: persistence save error:', errorMessage(e));
+            await revertMotor(motor);
+            notToSave = toSave.concat(notToSave);
+            toSave = [];
+        }
+    }
+    if (toSave.length) {
+        log('info', 'DX Save: values updated:', toSave);
+        writeBack(object, toSave, saveIntents, queue);
+        callHook(hooks, 'updated', object, toSave, Object.assign({}, saveIntents));
+    }
+    if (notToSave.length) {
+        log('warn', 'DX Save: values NOT updated:', notToSave);
+        rollback(object, notToSave, saveIntents, queue);
+        callHook(hooks, 'notUpdated', object, notToSave, Object.assign({}, saveIntents));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// PersistenceReactive: watches every instance of a reactive class
+// ---------------------------------------------------------------------------
+
 let PersistenceReactiveFn = function () { throw new Error('DX Save: initialize with PersistenceReactiveSetFn(fn)'); };
-export function PersistenceReactiveSetFn(fn) { PersistenceReactiveFn = fn; }
+export function PersistenceReactiveSetFn(fn) {
+    assertFunction('PersistenceReactiveSetFn', fn);
+    PersistenceReactiveFn = fn;
+}
+
 let PersistenceReactiveSource = {};
-export function PersistenceReactiveSetSource(source) { PersistenceReactiveSource = source; }
-export function PersistenceReactive(className, handlers = {}, hooks = {}) {
-    let saveIntents = {};
-    PersistenceReactiveFn(className, function (property, value) {
-        if (this.__isSystemRollback) {
+export function PersistenceReactiveSetSource(source) {
+    if (!isObjectLike(source)) {
+        throw new TypeError('DX Save: PersistenceReactiveSetSource expects an object.');
+    }
+    PersistenceReactiveSource = source;
+}
+
+export function PersistenceReactive(className, handlers = {}, hooks = {}, delay = DEFAULT_DELAY) {
+    handlers = handlers || {};
+    hooks = hooks || {};
+    // One queue per instance: edits of different objects never get mixed.
+    const queues = new WeakMap();
+    const unsubscribe = PersistenceReactiveFn(className, function (property, value) {
+        if (isSystemWrite(this, property, value)) {
             return true;
         }
         try {
-            saveIntents[property] = saveIntents[property] || {};
-            saveIntents[property].value = value;
-            if (typeof saveIntents[property].previousValue === 'undefined') {
-                saveIntents[property].previousValue = this[property];
+            if (!isObjectLike(this)) {
+                throw new Error('the reactive callback must be called with the mutated object as "this".');
             }
-            debounce(className + '-saveAllIntents', async () => {
-                const intentsCopy = Object.assign(Object.create(null), saveIntents);
-                saveIntents = {};
-                await PersistenceInternalHandler(intentsCopy, PersistenceReactiveSource[className], this, handlers, hooks);
-            });
+            let queue = queues.get(this);
+            if (!queue) {
+                queue = new IntentQueue(delay, (batch, owner) => PersistenceInternalHandler(batch, PersistenceReactiveSource[className], this, handlers, hooks, owner));
+                queues.set(this, queue);
+            }
+            queue.add(property, value, () => this[property]);
         }
         catch (e) {
-            console.error('PersistenceReactive error:', e.message);
-            saveIntents = {};
+            log('error', 'DX Save: PersistenceReactive error:', errorMessage(e));
             return false;
         }
         return true;
     });
+    return typeof unsubscribe === 'function' ? unsubscribe : undefined;
 }
-let PersistenceInternalHandlers = {
-    'Upload': async function () { throw new Error('DX Save: initialize with PersistenceInternalHandlerSet("Upload", fn)'); }
-};
-export function PersistenceInternalHandlerSet(handler, fn) { PersistenceInternalHandlers[handler] = fn; }
-async function PersistenceInternalHandler(saveIntents, persistenceMotorObject, object, handlers = {}, hooks = {}) {
-    var _a, _b, _c, _d, _e;
-    console.info('Save intent:', saveIntents);
-    let persistenceMotorObjectIsObject = persistenceMotorObject && typeof persistenceMotorObject === 'object';
-    let persistenceMotorObjectIsCustom = persistenceMotorObjectIsObject && typeof (persistenceMotorObject === null || persistenceMotorObject === void 0 ? void 0 : persistenceMotorObject.upload) === 'function' && typeof (persistenceMotorObject === null || persistenceMotorObject === void 0 ? void 0 : persistenceMotorObject.set) === 'function' && typeof (persistenceMotorObject === null || persistenceMotorObject === void 0 ? void 0 : persistenceMotorObject.save) === 'function';
-    let toSave = [];
-    let notToSave = [];
-    for (let property of Object.keys(saveIntents)) {
-        let saveIntent = saveIntents[property];
-        let saveIntentIsObject = saveIntent.previousValue && typeof saveIntent.previousValue === 'object' && saveIntent.value && typeof saveIntent.value === 'object';
-        let isCapableToSave = saveIntentIsObject ? true : saveIntent.previousValue !== saveIntent.value;
-        if (isCapableToSave) {
-            for (let handlerProperty of Object.keys(handlers)) {
-                let handler = handlers[handlerProperty];
-                let handlerIsFn = typeof handler === 'function';
-                let handlerIsObj = typeof handler === 'object';
-                if (!handler || (!handlerIsFn && !handlerIsObj)) {
-                    continue;
-                }
-                if (handlerProperty === property && handlerIsFn) {
-                    try {
-                        console.info('"' + handlerProperty + '" handler:', saveIntent.value, saveIntent.previousValue);
-                        let handlerResponse = await handler(saveIntent.value, saveIntent.previousValue, saveIntent);
-                        saveIntent.value = handlerResponse;
-                    }
-                    catch (e) {
-                        console.error('"' + handlerProperty + '" handler error:', e.message);
-                        isCapableToSave = false;
-                    }
-                    break;
-                }
-                else if (handlerProperty === 'images' && handlerIsObj && ((_a = handler === null || handler === void 0 ? void 0 : handler.properties) === null || _a === void 0 ? void 0 : _a.includes(property))) {
-                    try {
-                        console.info('File save intent:', property, saveIntent.value);
-                        let imgFormat = saveIntent.value.format;
-                        let imgPath = saveIntent.value.webPath;
-                        let blob;
-                        if (((_b = saveIntent.value) === null || _b === void 0 ? void 0 : _b.webPath) && ((_c = saveIntent.value) === null || _c === void 0 ? void 0 : _c.format)) {
-                            let img = await fetch(imgPath);
-                            blob = await img.blob();
-                        }
-                        else if (((_d = saveIntent.value) === null || _d === void 0 ? void 0 : _d.files) && ((_e = saveIntent.value.files) === null || _e === void 0 ? void 0 : _e.length) && saveIntent.value.files[0].name && saveIntent.value.files[0].size) {
-                            blob = saveIntent.value.files[0];
-                        }
-                        else {
-                            throw new Error('File is incompatible for uploading.');
-                        }
-                        saveIntent.value = persistenceMotorObjectIsCustom ? await persistenceMotorObjectIsCustom.upload(blob, imgFormat, property) : await PersistenceInternalHandlers.Upload((property + '.' + imgFormat), blob);
-                        console.info('Upload result:', property, saveIntent.value);
-                        saveIntent.maskValue = { url: imgPath };
-                    }
-                    catch (e) {
-                        console.error('File save intent error:', e.message);
-                        isCapableToSave = false;
-                    }
-                    break;
-                }
-            }
-        }
-        if (isCapableToSave) {
-            object[property] = saveIntent.maskValue || saveIntent.value;
-            try {
-                if (persistenceMotorObjectIsObject) {
-                    persistenceMotorObject.set(property, saveIntent.value);
-                }
-                toSave.push(property);
-            }
-            catch (e) {
-                console.error('Persistence motor set error:', e.message);
-                notToSave.push(property);
-            }
-        }
-        else {
-            notToSave.push(property);
-        }
-    }
-    try {
-        if (typeof hooks['preUpdate'] === 'function') {
-            hooks['preUpdate'].call(object, toSave, notToSave);
-        }
-        if (toSave.length) {
-            if (persistenceMotorObjectIsObject) {
-                await persistenceMotorObject.save();
-            }
-            console.info('Values updated:', toSave);
-            if (typeof hooks['updated'] === 'function') {
-                try {
-                    hooks['updated'].call(object, toSave, Object.assign({}, saveIntents));
-                }
-                catch (e) {
-                    console.warn('Updated hook failed.');
-                }
-            }
-        }
-    }
-    catch (e) {
-        console.error('Persistence motor save error:', e.message);
-        notToSave = toSave.concat(notToSave);
-        toSave = [];
-    }
-    try {
-        if (notToSave.length) {
-            console.warn('Values NOT updated:', notToSave);
-            Object.defineProperty(object, '__isSystemRollback', {
-                value: true,
-                writable: true,
-                enumerable: false,
-                configurable: true
-            });
-            for (let failedProperty of notToSave) {
-                object[failedProperty] = saveIntents[failedProperty].previousValue;
-            }
-            delete object.__isSystemRollback;
-            if (typeof hooks['notUpdated'] === 'function') {
-                hooks['notUpdated'].call(object, notToSave, Object.assign({}, saveIntents));
-            }
-        }
-    }
-    catch (e) {
-        console.error('Persistence motor regenerate error:', e.message);
-    }
-}
-const persistenceIntents = {};
-async function PersistenceHandler(id, property, value, object, root, persistenceLogic, delay = 2000) {
-    try {
-        persistenceIntents[id] = persistenceIntents[id] || {};
-        persistenceIntents[id][property] = persistenceIntents[id][property] || {};
-        persistenceIntents[id][property].value = value;
-        if (typeof persistenceIntents[id][property].previousValue === 'undefined') {
-            persistenceIntents[id][property].previousValue = object[property];
-        }
-        debounce(id + '-persistenceAllIntents', async () => {
-            //console.info('Persistence intent:', persistenceIntents[id]);
-            const intentsCopy = Object.assign(Object.create(null), persistenceIntents[id]);
-            delete persistenceIntents[id];
-            await persistenceLogic.call(intentsCopy, property, value, object, root);
-        }, delay);
-    }
-    catch (e) {
-        console.error('PersistenceHandler error:', e.message);
-        delete persistenceIntents[id];
-        return false;
-    }
-    return true;
-}
+
+// ---------------------------------------------------------------------------
+// PersistenceForm: auto-saves a form bound to one persistence target
+// ---------------------------------------------------------------------------
+
 let PersistenceFormFn = function () { throw new Error('DX Save: initialize with PersistenceFormSetFn(fn)'); };
-export function PersistenceFormSetFn(fn) { PersistenceFormFn = fn; }
-export function PersistenceForm(handlers = {}, hooks = {}, delay = 2000) {
-    const id = ('persistenceForm-' + Date.now() + '-' + Math.round(Math.random() * 1234567890));
+export function PersistenceFormSetFn(fn) {
+    assertFunction('PersistenceFormSetFn', fn);
+    PersistenceFormFn = fn;
+}
+
+export function PersistenceForm(handlers = {}, hooks = {}, delay = DEFAULT_DELAY) {
+    handlers = handlers || {};
+    hooks = hooks || {};
+    if (!isMotor(handlers.target)) {
+        throw new TypeError('DX Save: PersistenceForm requires handlers.target implementing set() and save().');
+    }
+    // One queue per mutated object, so nested objects of a form are saved independently.
+    const queues = new WeakMap();
     const persistenceForm = PersistenceFormFn(async function (property, value, object, root) {
-        if (object.__isSystemRollback || root.__isSystemRollback) {
+        if (isSystemWrite(object, property, value) || isSystemWrite(root, property, value)) {
             return true;
         }
-        if (typeof hooks['preMutation'] === 'function') {
-            await hooks['preMutation'].call(persistenceForm, property, value, object, root);
+        if (!isObjectLike(object)) {
+            log('error', 'DX Save: PersistenceForm error: the mutated object is missing.');
+            return false;
         }
-        const persistenceHandlerReturn = await PersistenceHandler(id, property, value, object, root, async function () {
-            try {
-                await PersistenceInternalHandler(this, handlers['target'], object, handlers, hooks);
+        // Everything up to queue.add() runs synchronously: the framework applies the new
+        // value as soon as this callback yields, and slow async hooks must not reorder edits.
+        const preMutation = callHook(hooks, 'preMutation', persistenceForm, property, value, object, root);
+        let accepted = true;
+        try {
+            let queue = queues.get(object);
+            if (!queue) {
+                queue = new IntentQueue(delay, (batch, owner) => PersistenceInternalHandler(batch, handlers.target, object, handlers, hooks, owner));
+                queues.set(object, queue);
             }
-            catch (e) {
-                console.error('PersistenceForm error:', e.message);
-                return false;
-            }
-            return true;
-        }, delay);
-        if (typeof hooks['postMutation'] === 'function') {
-            await hooks['postMutation'].call(persistenceForm, property, value, object, root);
+            queue.add(property, value, () => object[property]);
         }
-        return persistenceHandlerReturn;
+        catch (e) {
+            log('error', 'DX Save: PersistenceForm error:', errorMessage(e));
+            accepted = false;
+        }
+        await preMutation;
+        await callHook(hooks, 'postMutation', persistenceForm, property, value, object, root);
+        return accepted;
     });
     return persistenceForm;
 }

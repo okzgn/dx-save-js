@@ -7,14 +7,16 @@ An **agnostic**, asynchronous, and reactive data persistence engine for JavaScri
 When building reactive web applications with auto-save capabilities (where data is persisted to the database as the user types), developers typically face three major challenges:
 
 1.  **Network Overhead:** Sending an HTTP request for every single keystroke.
-2.  **Race Conditions:** Saving obsolete data if the user types faster than the server can respond.
+2.  **Race Conditions:** Two saves of the same record running at the same time, or a failed save wiping out something the user typed afterwards.
 3.  **Infinite Reactive Loops (Rollback Hell):** If a save request fails and you revert the value in the frontend (Optimistic UI rollback), your reactive framework detects that rollback as a "new mutation" and tries to save it again, creating an infinite loop.
 
-**Reactive Persistence Engine** solves all of this automatically:
-*   ⏱️ **Smart Debouncing:** Batches multiple mutations into a single network request (defaults to 2000ms) with zero memory leaks.
-*   🛡️ **Reactive Loop Prevention:** Uses non-enumerable properties (`__isSystemRollback`) to revert data temporarily without re-triggering reactive listeners.
+**DX Save** solves all of this automatically:
+*   ⏱️ **Smart Debouncing:** Batches multiple mutations into a single request (defaults to 2000ms). Every object has its own queue, so editing two records never mixes their changes.
+*   🔒 **Serialized Saves:** The batches of one target never overlap: a batch waits for the previous save to finish, and edits made in the meantime are merged into it.
+*   🛡️ **Reactive Loop Prevention:** Values written by the engine itself (rollbacks and write-backs) are flagged so your reactive listeners ignore them.
 *   🔌 **100% Framework Agnostic (Dependency Injection):** Not tied to React, Vue, Angular, or Parse. You inject how it listens to changes and how it saves them.
 *   🖼️ **Native File Management:** Intercepts URLs, Blobs, and `<input type="file">` automatically, uploads them, and attaches the resulting file object to the database record.
+*   🤫 **Safe Logging:** Logs contain property names and error messages, never the values being saved.
 
 ---
 
@@ -24,11 +26,13 @@ When building reactive web applications with auto-save capabilities (where data 
 npm install dx-save
 ```
 
+Requires Node.js 18 or newer (or any modern browser bundler target with `fetch`).
+
 ---
 
 ## 📦 Initialization & Setup (Dependency Injection)
 
-Because the library is completely agnostic, it uses a **Fail-Fast** design. If you don't configure the engine, it will throw clear errors to help Developer Experience (DX). 
+Because the library is completely agnostic, it uses a **Fail-Fast** design. If you don't configure the engine, it will throw clear errors to help Developer Experience (DX).
 
 The very first step in your application (e.g., `main.js` or `index.ts`) is to inject your framework's reactive behavior and your backend's upload logic.
 
@@ -38,15 +42,17 @@ import {
   PersistenceReactiveSetSource,
   PersistenceFormSetFn, 
   PersistenceInternalHandlerSet,
+  PersistenceSetLogger,
 } from 'dx-save';
 
 // 1. How does your framework listen to global class/store changes?
+//    The callback MUST be called with `this` set to the mutated object and
+//    BEFORE the new value is applied (the engine reads the previous value from it).
 PersistenceReactiveSetFn((className, callback) => {
   // Example using a hypothetical reactive store 'MyStore'
-  MyStore.on(className, function(property, value) {
-    // It's vital to bind the 'this' context if your framework relies on it
-    callback.call(this, property, value); 
-  });
+  return MyStore.on(className, function(property, value) {
+    return callback.call(this, property, value); 
+  }); // optional: return an unsubscribe function
 });
 
 // 2. (Optional) Dictionary of your global DB engine instances
@@ -59,7 +65,7 @@ PersistenceReactiveSetSource({
 PersistenceFormSetFn((engineCallback) => {
   // Return a bridge/wrapper that your reactive form system will use
   return async function formMutationListener(property, value, targetObject, rootObject) {
-    return await engineCallback.call(this, property, value, targetObject, rootObject);
+    return await engineCallback(property, value, targetObject, rootObject);
   };
 });
 
@@ -70,7 +76,24 @@ PersistenceInternalHandlerSet('Upload', async (fileName, blob) => {
   const res = await fetch('/api/upload', { method: 'POST', body: formData });
   return await res.json(); // Return the object/reference the DB expects
 });
+
+// 5. (Optional) Where do logs go? Warnings and errors use `console` by default,
+//    info logs are silent. Pass `null` to silence everything.
+PersistenceSetLogger({ info: console.debug, warn: console.warn, error: console.error });
 ```
+---
+
+## 🔌 The persistence target ("motor")
+
+Whatever receives the data (a Parse object, a Firebase doc, your own API wrapper) must implement:
+
+| Method | Required | Purpose |
+| :--- | :---: | :--- |
+| `set(property, value)` | ✅ | Stages a value on the record. |
+| `save()` | ✅ | Persists the staged values. May be `async`. |
+| `upload(blob, format, property)` | ➖ | Replaces the global `Upload` handler for this target. |
+| `revert()` | ➖ | Called after a failed `save()` so the record forgets the values already `set()` (e.g. Parse's `revert()`). |
+
 ---
 
 ## 📖 Core Use Cases & Examples
@@ -83,7 +106,7 @@ Ideal for views where you have a specific form editing a specific database recor
 import { PersistenceForm } from 'dx-save';
 
 // Assume this is your DB record instance (Parse Object, Firebase Doc, Custom API wrapper)
-// It MUST implement .set() and .save() methods.
+// It MUST implement .set() and .save() methods, otherwise PersistenceForm throws a TypeError.
 const myArticleDBRecord = {
   set: (prop, val) => { /* logic */ },
   save: async () => { /* logic */ }
@@ -101,8 +124,8 @@ const form = PersistenceForm(
   {
     // Lifecycle Hooks
     preMutation: (prop, val) => console.log(`About to mutate ${prop}`),
-    updated: (obj, savedProps, intents) => console.log('Successfully saved!', savedProps),
-    notUpdated: (obj, failedProps) => console.error('Save failed, rolling back...', failedProps)
+    updated: function (savedProps, intents) { console.log('Successfully saved!', savedProps); },
+    notUpdated: function (failedProps, intents) { console.error('Save failed, rolled back:', failedProps); }
   },
   1500 // Debounce delay in ms (Defaults to 2000ms)
 );
@@ -116,7 +139,7 @@ document.querySelector('#titleInput').addEventListener('input', (e) => {
 
 ### Use Case 2: Global Entity Tracking (`PersistenceReactive`)
 
-If your application has a global reactive state (e.g., a Store where all "User" records live), you can tell the engine to watch an entire class globally.
+If your application has a global reactive state (e.g., a Store where all "User" records live), you can tell the engine to watch an entire class globally. Each instance gets its own debounce queue.
 
 ```javascript
 import { PersistenceReactive } from 'dx-save';
@@ -129,8 +152,10 @@ PersistenceReactive(
     password: async (val) => await encryptPassword(val)
   },
   {
-    updated: (obj, toSaveProps) => toast.success(`User updated: ${toSaveProps.join(', ')}`)
-  }
+    // `this` is the mutated object
+    updated: function (savedProps) { toast.success(`User updated: ${savedProps.join(', ')}`); }
+  },
+  2000 // Optional debounce delay in ms
 );
 ```
 
@@ -146,14 +171,16 @@ const form = PersistenceForm({
 });
 
 // From your UI, you can pass a web URL. 
-// The engine will fetch() it, convert it to a Blob, call your injected 'Upload' 
-// handler, and finally set the resulting file object to the DB record.
+// The engine will fetch() it (a non-2xx response fails the save), convert it to a Blob,
+// call your injected 'Upload' handler, and finally set the resulting file object to the
+// DB record. The UI keeps showing `{ url: webPath }`.
 form.avatar = { 
   format: 'png', 
   webPath: 'https://example.com/new-photo.png' 
 };
 
-// OR, you can pass a native FileList from an <input type="file">
+// OR, you can pass a native FileList from an <input type="file">.
+// `format` is optional: it is taken from the file name or MIME type.
 form.cover = { files: fileInputElement.files };
 ```
 
@@ -161,17 +188,19 @@ form.cover = { files: fileInputElement.files };
 
 ## ⚙️ Lifecycle Hooks API
 
-The engine exposes a powerful hook system so you can react to events (like showing spinners or toast notifications) without coupling UI logic to the data engine. 
+The engine exposes a hook system so you can react to events (like showing spinners or toast notifications) without coupling UI logic to the data engine. Hooks only *observe*: an exception thrown by a hook is logged as a warning and never affects persistence.
 
 Passed as the second argument (`hooks` object) to `PersistenceForm` or `PersistenceReactive`:
 
 | Hook | Execution Timing | Parameters |
 | :--- | :--- | :--- |
-| `preMutation` | Fired immediately when a change is detected, *before* the debounce timer starts. | `(property, value, object, root)` |
-| `postMutation`| Fired immediately after the change is added to the debounce queue. | `(property, value, object, root)` |
-| `preUpdate` | Fired when the debounce finishes, right before calling `.save()` on the DB target. | `(toSaveArray, notToSaveArray)` *(Contextualized to `object`)* |
-| `updated` | Fired if the persistence engine successfully saved the data. | `(toSaveArray, saveIntentsObject)` *(Contextualized to `object`)* |
-| `notUpdated` | Fired if the HTTP/DB request failed and the Optimistic UI Rollback was applied. | `(failedPropsArray, saveIntentsObject)` *(Contextualized to `object`)* |
+| `preMutation` | *(Form only)* Fired immediately when a change is detected, *before* it is queued. If it is `async`, queuing does not wait for it, so edits keep their order. | `(property, value, object, root)` — `this` is the form |
+| `postMutation`| *(Form only)* Fired after the change is queued and `preMutation` has finished. | `(property, value, object, root)` — `this` is the form |
+| `preUpdate` | Fired when the debounce finishes, right before calling `.save()`. Not fired when there is nothing to save. | `(toSaveArray, notToSaveArray)` — `this` is the object |
+| `updated` | Fired if the persistence engine successfully saved the data. | `(savedPropsArray, saveIntentsObject)` — `this` is the object |
+| `notUpdated` | Fired if a value could not be saved and the Optimistic UI Rollback was applied. | `(failedPropsArray, saveIntentsObject)` — `this` is the object |
+
+Properties that end up with the value they started with (`"A" → "B" → "A"` inside one debounce window) are not saved and are not reported as failures.
 
 ---
 
@@ -183,13 +212,27 @@ One of the strongest features of this library is its Optimistic UI error handlin
 2. The UI instantly displays "B" (Optimistic).
 3. The engine batches the intent and tries to save "B" to the server.
 4. The server throws a 500 Error (or validation fails).
-5. The engine silently restores the UI state back to "A" (`previousValue`).
+5. The engine silently restores the UI state back to "A" (`previousValue`) and calls `target.revert()` if it exists.
 
 **The Challenge:** If we programmatically change the UI back to "A", reactive frameworks (Vue, MobX, Signals) will detect this as a *new mutation* and try to save "A" to the server, creating a ghost request or an infinite loop.
 
-**The Engine's Solution:** Before rolling back, the engine injects a temporary, non-enumerable property `__isSystemRollback`.
+**The Engine's Solution:** Every write made by the engine (rollbacks, and write-backs of values transformed by handlers or uploads) is marked as a *system write*: a temporary, non-enumerable `__isSystemRollback` flag is set while it happens, and the written value is remembered for a moment so frameworks that notify one tick later are recognised too. Both `PersistenceForm` and `PersistenceReactive` ignore those events, cleanly breaking the infinite loop. Because the flag is non-enumerable, standard parsers (like `JSON.stringify` or SDKs like Parse) will not accidentally save it, and it is always removed in a `finally` block.
 
-Both `PersistenceForm` and `PersistenceReactive` validate if `__isSystemRollback` is present. If it is, **they ignore the event**, cleanly breaking the infinite loop. Because it uses `enumerable: false`, it guarantees that standard parsers (like `JSON.stringify` or SDKs like Parse) will not accidentally save this internal flag to your database.
+**Edits made while a save is in flight** are never clobbered: if the user types again before a failing save is rolled back, their newer value is kept and, should that newer edit fail too, it rolls back to the last value that was really persisted.
+
+> **Contract:** the engine reads the previous value from the object when it is notified, so your reactive listener must call the engine *before* the new value is applied. Frameworks that only notify afterwards (e.g. a `watch` callback) need a bridge that exposes the old value.
+>
+> A save that never settles blocks the following saves of the same target, so make sure your `save()` and `upload()` have timeouts.
+
+---
+
+## 🧪 Development
+
+```bash
+npm test
+```
+
+Uses the built-in `node:test` runner; no dependencies required.
 
 ---
 
@@ -198,3 +241,5 @@ Both `PersistenceForm` and `PersistenceReactive` validate if `__isSystemRollback
 MIT License.
 
 Copyright © 2026 [OKZGN](https://okzgn.com)
+
+See [CHANGELOG.md](CHANGELOG.md) for release notes.
