@@ -1,5 +1,5 @@
 {
-  "name": "dx-save",
+  "name": "dx-save-js",
   "version": "3.0.0",
   "description": "An agnostic, asynchronous, and reactive data persistence engine for JavaScript/TypeScript. Designed to seamlessly handle auto-saving, optimistic UI, debouncing, and error recovery without triggering infinite reactive loops.",
   "type": "module",
